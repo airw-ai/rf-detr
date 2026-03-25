@@ -357,12 +357,10 @@ def resolve_auto_batch_config(
     else:
         world_size = 1
 
-    # Interpret auto_batch_target_effective as a global target and derive a per-device target
-    target_effective_global = train_config.auto_batch_target_effective
-    if world_size > 1:
-        target_effective_per_device = max(1, math.ceil(target_effective_global / world_size))
-    else:
-        target_effective_per_device = target_effective_global
+    # auto_batch_target_effective is a per-device target (see TrainConfig docstring).
+    # Each GPU independently targets this effective batch size; the global effective batch
+    # is therefore auto_batch_target_effective * world_size.
+    target_effective_per_device = train_config.auto_batch_target_effective
 
     grad_accum_steps = recommend_grad_accum_steps(safe_micro_batch, target_effective_per_device)
     effective_batch_size_per_device = safe_micro_batch * grad_accum_steps

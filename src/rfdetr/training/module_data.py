@@ -6,12 +6,15 @@
 
 """LightningDataModule for RF-DETR dataset construction and loaders."""
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed
 import torch.utils.data
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import ModelConfig, TrainConfig
@@ -54,8 +57,25 @@ class RFDETRDataModule(LightningDataModule):
             self._prefetch_factor = (
                 self.train_config.prefetch_factor if self.train_config.prefetch_factor is not None else 2
             )
+            # Use 'forkserver' instead of the default 'fork' to prevent NCCL deadlocks
+            # in DDP training.
+            #
+            # Why not 'fork': workers inherit the parent's NCCL IPC file descriptors,
+            # corrupting the communicator in the main DDP process on the next collective.
+            #
+            # Why not 'spawn': each spawned worker imports PyTorch from scratch (~10-30 s).
+            # With 8 ranks × 4 workers starting simultaneously at validation time, all ranks
+            # are blocked waiting for workers while PTL's NCCL barrier waits for all ranks —
+            # a circular deadlock that fires after 30 minutes (the NCCL watchdog timeout).
+            #
+            # 'forkserver' starts a single clean server process via spawn (no NCCL fds).
+            # Workers are then forked from that running server in milliseconds — fast enough
+            # that all ranks are ready before any NCCL barrier times out.  This lets both
+            # train and val DataLoaders use num_workers > 0 safely.
+            self._multiprocessing_context: str | None = "forkserver"
         else:
             self._prefetch_factor = None
+            self._multiprocessing_context = None
 
     # ------------------------------------------------------------------
     # PTL lifecycle hooks
@@ -112,11 +132,28 @@ class RFDETRDataModule(LightningDataModule):
                 len(dataset),
                 effective_batch_size * _MIN_TRAIN_BATCHES,
             )
-            sampler = torch.utils.data.RandomSampler(
-                dataset,
-                replacement=True,
-                num_samples=effective_batch_size * _MIN_TRAIN_BATCHES,
-            )
+            # In DDP, PTL only auto-injects DistributedSampler when shuffle=True is used.
+            # When a custom sampler is passed, PTL leaves it as-is, causing every rank to
+            # see the same data. Use DistributedSampler explicitly for the small-dataset path.
+            world_size = self.trainer.world_size if self.trainer is not None else 1
+            rank = self.trainer.global_rank if self.trainer is not None else 0
+            if world_size > 1:
+                num_samples_per_rank = math.ceil(effective_batch_size * _MIN_TRAIN_BATCHES / world_size)
+                sampler: torch.utils.data.Sampler = DistributedSampler(
+                    dataset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=True,
+                    drop_last=False,
+                )
+                # Override num_samples so each rank provides enough batches.
+                sampler.num_samples = num_samples_per_rank
+            else:
+                sampler = torch.utils.data.RandomSampler(
+                    dataset,
+                    replacement=True,
+                    num_samples=effective_batch_size * _MIN_TRAIN_BATCHES,
+                )
             return DataLoader(
                 dataset,
                 batch_size=batch_size,
@@ -126,6 +163,7 @@ class RFDETRDataModule(LightningDataModule):
                 pin_memory=self._pin_memory,
                 persistent_workers=self._persistent_workers,
                 prefetch_factor=self._prefetch_factor,
+                multiprocessing_context=self._multiprocessing_context,
             )
 
         return DataLoader(
@@ -138,6 +176,7 @@ class RFDETRDataModule(LightningDataModule):
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
             prefetch_factor=self._prefetch_factor,
+            multiprocessing_context=self._multiprocessing_context,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -156,6 +195,7 @@ class RFDETRDataModule(LightningDataModule):
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
             prefetch_factor=self._prefetch_factor,
+            multiprocessing_context=self._multiprocessing_context,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -174,6 +214,7 @@ class RFDETRDataModule(LightningDataModule):
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
             prefetch_factor=self._prefetch_factor,
+            multiprocessing_context=self._multiprocessing_context,
         )
 
     def predict_dataloader(self) -> DataLoader:
@@ -192,6 +233,7 @@ class RFDETRDataModule(LightningDataModule):
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
             prefetch_factor=self._prefetch_factor,
+            multiprocessing_context=self._multiprocessing_context,
         )
 
     # ------------------------------------------------------------------

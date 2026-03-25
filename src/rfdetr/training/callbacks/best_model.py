@@ -239,38 +239,48 @@ class BestModelCallback(ModelCheckpoint):
         ``checkpoint_best_total.pth``, strips optimizer/scheduler state, then
         optionally runs ``trainer.test()``.
 
+        In DDP, file operations (copy, strip) run on rank 0 only.  A barrier
+        then synchronises all ranks before weight loading and ``trainer.test()``,
+        which are collective operations that every rank must execute together.
+
         Args:
             trainer: The Lightning Trainer instance.
             pl_module: The ``RFDETRModelModule`` being trained.
         """
-        if not trainer.is_global_zero:
-            return
-
-        best_regular = self.best_model_score.item() if self.best_model_score is not None else 0.0
-        regular_path = Path(self.best_model_path) if self.best_model_path else None
-        ema_path = self._output_dir / "checkpoint_best_ema.pth"
         total_path = self._output_dir / "checkpoint_best_total.pth"
 
-        # Strict > for EMA to win (matches legacy behaviour).
-        best_is_ema = self._best_ema > best_regular
-        best_path = ema_path if (best_is_ema and ema_path.exists()) else regular_path
+        # --- Rank-0 only: checkpoint file operations ---
+        if trainer.is_global_zero:
+            best_regular = self.best_model_score.item() if self.best_model_score is not None else 0.0
+            regular_path = Path(self.best_model_path) if self.best_model_path else None
+            ema_path = self._output_dir / "checkpoint_best_ema.pth"
 
-        if best_path and best_path.exists():
-            shutil.copy2(best_path, total_path)
-            strip_checkpoint(total_path)
-            logger.info(
-                "Best total checkpoint saved from %s (regular=%.4f, ema=%.4f)",
-                "EMA" if best_is_ema else "regular",
-                best_regular,
-                self._best_ema,
-            )
+            # Strict > for EMA to win (matches legacy behaviour).
+            best_is_ema = self._best_ema > best_regular
+            best_path = ema_path if (best_is_ema and ema_path.exists()) else regular_path
 
+            if best_path and best_path.exists():
+                shutil.copy2(best_path, total_path)
+                strip_checkpoint(total_path)
+                logger.info(
+                    "Best total checkpoint saved from %s (regular=%.4f, ema=%.4f)",
+                    "EMA" if best_is_ema else "regular",
+                    best_regular,
+                    self._best_ema,
+                )
+
+        # --- All ranks: test evaluation (collective) ---
         if self._run_test:
             # Only call trainer.test() when the module actually defines test_step().
             cls_test_step = getattr(type(pl_module), "test_step", None)
             has_test_step = cls_test_step is not None and cls_test_step is not LightningModule.test_step
             if has_test_step:
-                # Load best weights before test — mirrors legacy main.py:602-609.
+                # Barrier: ensure rank 0 has finished writing checkpoint_best_total.pth
+                # before all ranks attempt to load it.  trainer.test() is a DDP collective
+                # and must be called on every rank — not rank 0 alone.
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                # All ranks load best weights before test — mirrors legacy main.py:602-609.
                 if total_path.exists():
                     ckpt = torch.load(total_path, map_location="cpu", weights_only=False)
                     # Checkpoints always store plain keys; load into the unwrapped module
@@ -278,7 +288,8 @@ class BestModelCallback(ModelCheckpoint):
                     _orig = getattr(pl_module.model, "_orig_mod", None)
                     raw = _orig if isinstance(_orig, torch.nn.Module) else pl_module.model
                     raw.load_state_dict(ckpt["model"], strict=True)
-                    logger.info("Loaded best weights from %s for test evaluation.", total_path)
+                    if trainer.is_global_zero:
+                        logger.info("Loaded best weights from %s for test evaluation.", total_path)
                 trainer.test(pl_module, datamodule=trainer.datamodule, verbose=False)
 
 

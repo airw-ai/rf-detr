@@ -363,6 +363,7 @@ class TrainConfig(BaseModel):
     do_random_resize_via_padding: bool = False
     use_ema: bool = True
     ema_update_interval: int = 1
+    ema_device: Literal["gpu", "cpu"] = "gpu"
     num_workers: int = 2
     weight_decay: float = 1e-4
     early_stopping: bool = False
@@ -383,6 +384,32 @@ class TrainConfig(BaseModel):
     eval_interval: int = 1
     log_per_class_metrics: bool = True
     aug_config: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def _auto_detect_torchrun_devices(self) -> "TrainConfig":
+        """Auto-set devices='auto' when launched via torchrun and devices not explicitly set.
+
+        torchrun sets ``LOCAL_WORLD_SIZE`` (number of GPUs on this node) and ``WORLD_SIZE``
+        (total processes across all nodes).  When the user launches with::
+
+            torchrun --nproc_per_node=4 train.py
+
+        but does not set ``devices``, the default ``devices=1`` causes each spawned process
+        to claim only one GPU instead of all available GPUs on the node.  Setting
+        ``devices='auto'`` tells PTL to use all GPUs available in the current environment.
+        """
+        if "devices" not in self.model_fields_set and os.environ.get("LOCAL_WORLD_SIZE"):
+            import warnings as _warnings
+
+            _warnings.warn(
+                "Detected torchrun environment (LOCAL_WORLD_SIZE is set) but devices was not "
+                "explicitly configured. Setting devices='auto' so all GPUs on this node are used. "
+                "Pass devices=N explicitly to suppress this warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.devices = "auto"
+        return self
 
     @model_validator(mode="after")
     def _warn_deprecated_train_config_fields(self) -> "TrainConfig":

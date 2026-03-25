@@ -67,9 +67,7 @@ class RFDETRModelModule(LightningModule):
 
         # torch.compile is opt-in: set model_config.compile=True to enable.
         # Only enabled on CUDA; MPS and CPU do not benefit from compilation.
-        compile_enabled = model_config.compile and torch.cuda.is_available() and not train_config.multi_scale
-        if model_config.compile and train_config.multi_scale:
-            logger.info("Disabling torch.compile because multi_scale=True introduces dynamic input shapes.")
+        compile_enabled = model_config.compile and torch.cuda.is_available()
         if compile_enabled:
             # dynamic=True: one compiled graph handles all multi-scale input sizes instead
             # of recompiling per (H, W) pair. suppress_errors=True: if inductor can't

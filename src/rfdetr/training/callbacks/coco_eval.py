@@ -92,6 +92,13 @@ class COCOEvalCallback(Callback):
         kwargs: dict[str, Any] = dict(
             class_metrics=True,
             max_detection_thresholds=[1, 10, self._max_dets],
+            # sync_on_compute=False: the val DataLoader uses SequentialSampler so every
+            # DDP rank processes the *same* validation images.  With the default
+            # sync_on_compute=True, torchmetrics would gather all 8 ranks' identical
+            # predictions before computing COCO metrics, producing 8× the predictions
+            # and making mask-IoU computation ~64× slower (O(8P × 8GT) vs O(P × GT)).
+            # Computing locally on each rank is both correct and fast.
+            sync_on_compute=False,
         )
         kwargs["backend"] = "faster_coco_eval"
         self.map_metric = MeanAveragePrecision(iou_type=iou_type, **kwargs)
@@ -180,6 +187,7 @@ class COCOEvalCallback(Callback):
                     class_metrics=True,
                     max_detection_thresholds=[1, 10, self._max_dets],
                     backend="faster_coco_eval",
+                    sync_on_compute=False,  # same reason as map_metric above
                 ).to(pl_module.device)
             samples, _ = batch
             orig_sizes = torch.stack([t["orig_size"] for t in outputs["targets"]]).to(pl_module.device)

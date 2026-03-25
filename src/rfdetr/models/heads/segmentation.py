@@ -4,7 +4,7 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
-from typing import Any, Callable
+from typing import Any, Callable, Dict
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,12 @@ class DepthwiseConvBlock(nn.Module):
     def __init__(self, dim, layer_scale_init_value=0):
         super().__init__()
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)  # depthwise conv
+        # cuDNN depthwise backward always produces weight gradients in channels-last layout
+        # (strides [C, 1, kH, kW] → [9, 1, 3, 1] for dim=256).  DDP builds its bucket views
+        # to match each parameter's strides at construction time, so initialising the weight
+        # in channels-last here makes bucket-view strides == grad strides → no extra copy and
+        # no "Grad strides do not match bucket view strides" UserWarning in multi-GPU runs.
+        self.dwconv.weight.data = self.dwconv.weight.data.to(memory_format=torch.channels_last)
         self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Linear(dim, dim)  # pointwise/1x1 convs, implemented with linear layers
         self.act = nn.GELU()
@@ -29,8 +35,12 @@ class DepthwiseConvBlock(nn.Module):
         )
 
     def _depthwise_conv(self, x: torch.Tensor) -> torch.Tensor:
-        # Always run this depthwise conv with cuDNN disabled to avoid
-        # backend engine selection failures on some CUDA stacks (e.g. T4/Colab).
+        # cuDNN backend engine selection for grouped (depthwise) convolutions fails on some
+        # pre-Ampere CUDA stacks (e.g. T4 / Colab, compute capability < 8.0).
+        # On Ampere+ GPUs (L4=8.9, A100=8.0, H100=9.0) cuDNN has reliable depthwise support
+        # with Tensor Core acceleration, so we leave cuDNN enabled there.
+        if x.device.type == "cuda" and torch.cuda.get_device_capability(x.device)[0] >= 8:
+            return self.dwconv(x)
         with torch.backends.cudnn.flags(enabled=False):
             return self.dwconv(x)
 
@@ -136,7 +146,7 @@ class SegmentationHead(nn.Module):
         query_features: list[torch.Tensor],
         image_size: tuple[int, int],
         skip_blocks: bool = False,
-    ) -> list[torch.Tensor]:
+    ) -> list[Dict[str, torch.Tensor]]:
         # spatial features: (B, C, H, W)
         # query features: [(B, N, C)] for each decoder layer
         # output: dict containing the intermediate results
@@ -338,5 +348,5 @@ def calculate_uncertainty(logits: torch.Tensor) -> torch.Tensor:
         uncertain locations having the highest uncertainty score.
     """
     assert logits.shape[1] == 1
-    gt_class_logits = logits.clone()
-    return -(torch.abs(gt_class_logits))
+    # torch.abs creates a new tensor, so no clone is needed here.
+    return -(torch.abs(logits))

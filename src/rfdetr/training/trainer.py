@@ -14,6 +14,7 @@ from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar, TQDMProgressBar
 from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
 from pytorch_lightning.loggers import CSVLogger, MLFlowLogger, TensorBoardLogger, WandbLogger
+from pytorch_lightning.strategies import DDPStrategy
 
 from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.training.callbacks import (
@@ -94,6 +95,27 @@ def build_trainer(
             stacklevel=2,
         )
 
+    # --- find_unused_parameters guard ---
+    # Segmentation head: mask parameters are not produced for every image in every batch
+    # (e.g. images with no instances), so not all parameters contribute to the loss on
+    # every step. DDP's reducer will raise RuntimeError on _rebuild_buckets() otherwise.
+    # freeze_encoder: all encoder params have requires_grad=False, DDP must skip them.
+    # backbone_lora: peft may leave stale requires_grad=True tensors that skip the graph.
+    needs_find_unused = (
+        model_config.segmentation_head or model_config.freeze_encoder or model_config.backbone_lora
+    )
+    _ddp_like = ("auto", "ddp", "ddp_find_unused_parameters_true")
+    if needs_find_unused and not sharded and str(strategy).lower() in _ddp_like:
+        if str(strategy).lower() != "ddp_find_unused_parameters_true":
+            _logger.info(
+                "Setting find_unused_parameters=True because segmentation_head=%s, "
+                "freeze_encoder=%s, backbone_lora=%s.",
+                model_config.segmentation_head,
+                model_config.freeze_encoder,
+                model_config.backbone_lora,
+            )
+        strategy = DDPStrategy(find_unused_parameters=True)
+
     # --- Build callbacks ---
     callbacks = []
 
@@ -108,6 +130,7 @@ def build_trainer(
                 decay=tc.ema_decay,
                 tau=tc.ema_tau,
                 update_interval_steps=tc.ema_update_interval,
+                ema_device=getattr(tc, "ema_device", "gpu"),
             )
         )
 
@@ -239,6 +262,12 @@ def build_trainer(
         "default_root_dir": tc.output_dir,
         "log_every_n_steps": 50,
         "deterministic": False,
+        # Skip the pre-training sanity check. In DDP, the sanity check creates a
+        # validation DataLoader *after* NCCL is initialised. DataLoader workers are
+        # started via fork() and inherit NCCL IPC handles, corrupting the
+        # communicator in the main process. The first subsequent NCCL collective
+        # then hangs until the 30-minute NCCL watchdog timeout fires.
+        "num_sanity_val_steps": 0,
     }
     trainer_config.update(trainer_kwargs)
     return Trainer(**trainer_config)

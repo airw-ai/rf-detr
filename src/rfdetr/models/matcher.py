@@ -20,6 +20,8 @@
 Modules to compute the matching cost and solve the corresponding LSAP.
 """
 
+import concurrent.futures
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -212,7 +214,16 @@ class HungarianMatcher(nn.Module):
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         if masks_present:
             C = C + self.cost_mask_ce * cost_mask_ce + self.cost_mask_dice * cost_mask_dice
-        C = C.view(bs, num_queries, -1).float().cpu()  # convert to float because bfloat16 doesn't play nicely with CPU
+        # Convert to float before CPU transfer: bfloat16 has no CPU scipy support.
+        # Use non_blocking=True so the PCIe transfer can overlap with other GPU work.
+        # We synchronize only once, right before the scipy calls, rather than blocking here.
+        C = C.view(bs, num_queries, -1).float().to("cpu", non_blocking=True)
+
+        # Synchronize here to ensure the non-blocking transfer is complete before scipy reads
+        # the tensor data. This single synchronize point replaces the implicit sync that
+        # occurred inside .cpu() in the previous implementation.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         # We assume any good match will not cause NaN or Inf, so replace invalid
         # entries with a finite value that is larger than every valid cost.
@@ -228,22 +239,29 @@ class HungarianMatcher(nn.Module):
             C = self._sanitize_cost_matrix(C)
 
         sizes = [len(v["boxes"]) for v in targets]
-        indices = []
         g_num_queries = num_queries // group_detr
         C_list = C.split(g_num_queries, dim=1)
-        for g_i in range(group_detr):
+
+        def _solve_group(g_i: int):
+            """Solve Hungarian matching for one group of queries."""
             C_g = C_list[g_i]
-            indices_g = [linear_sum_assignment(c[i]) for i, c in enumerate(C_g.split(sizes, -1))]
-            if g_i == 0:
-                indices = indices_g
-            else:
-                indices = [
-                    (
-                        np.concatenate([indice1[0], indice2[0] + g_num_queries * g_i]),
-                        np.concatenate([indice1[1], indice2[1]]),
-                    )
-                    for indice1, indice2 in zip(indices, indices_g)
-                ]
+            return [linear_sum_assignment(c[i]) for i, c in enumerate(C_g.split(sizes, -1))]
+
+        # scipy.optimize.linear_sum_assignment releases the GIL, so thread-based
+        # parallelism gives real speedup when group_detr > 1 (default: 13 groups).
+        with concurrent.futures.ThreadPoolExecutor(max_workers=group_detr) as pool:
+            group_results = list(pool.map(_solve_group, range(group_detr)))
+
+        indices = group_results[0]
+        for g_i in range(1, group_detr):
+            indices_g = group_results[g_i]
+            indices = [
+                (
+                    np.concatenate([indice1[0], indice2[0] + g_num_queries * g_i]),
+                    np.concatenate([indice1[1], indice2[1]]),
+                )
+                for indice1, indice2 in zip(indices, indices_g)
+            ]
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
 

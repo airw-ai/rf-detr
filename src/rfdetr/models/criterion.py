@@ -373,10 +373,15 @@ class SetCriterion(nn.Module):
                 batched_selected_masks = []
                 per_batch_counts = idx[0].unique(return_counts=True)[1]
                 batch_indices = torch.cat((torch.zeros_like(per_batch_counts[:1]), per_batch_counts), dim=0).cumsum(0)
+                # Convert to Python list with a single .tolist() call so that the per-iteration
+                # slice bounds are plain Python ints, not tensor scalars.  Using tensor scalars as
+                # slice indices triggers an implicit .item() (GPU→CPU sync) on every iteration,
+                # adding 2 × batch_size synchronisation points per training step.
+                batch_indices_list = batch_indices.tolist()
 
                 for i in range(per_batch_counts.shape[0]):
-                    batch_indicator = idx[0][batch_indices[i] : batch_indices[i + 1]]
-                    box_indicator = idx[1][batch_indices[i] : batch_indices[i + 1]]
+                    batch_indicator = idx[0][batch_indices_list[i] : batch_indices_list[i + 1]]
+                    box_indicator = idx[1][batch_indices_list[i] : batch_indices_list[i + 1]]
 
                     this_batch_queries = query_features[(batch_indicator, box_indicator)]
                     this_batch_spatial_features = spatial_features[idx[0][batch_indices[i + 1] - 1]]

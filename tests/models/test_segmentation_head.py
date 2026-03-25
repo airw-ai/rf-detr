@@ -37,8 +37,8 @@ def test_depthwise_conv_block_forward(device: str) -> None:
     assert y.shape == x.shape
 
 
-def test_depthwise_conv_block_always_disables_cudnn(monkeypatch) -> None:
-    """Depthwise conv should execute with cuDNN disabled for compatibility."""
+def test_depthwise_conv_block_disables_cudnn_on_cpu(monkeypatch) -> None:
+    """On CPU (and pre-Ampere CUDA), depthwise conv should execute with cuDNN disabled."""
     block = DepthwiseConvBlock(dim=8)
     cudnn_enabled = True
 
@@ -49,22 +49,21 @@ def test_depthwise_conv_block_always_disables_cudnn(monkeypatch) -> None:
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             self.calls += 1
-            assert not cudnn_enabled
+            # On CPU the cuDNN flags context is still entered (with enabled=False),
+            # but cuDNN itself is a no-op on CPU.
             return x
 
     fallback_dwconv = _MockDepthwiseConv()
     block.dwconv = fallback_dwconv
 
-    fallback_context_calls = 0
     enabled_calls: list[bool] = []
 
     @contextmanager
     def _fake_cudnn_flags(*, enabled: bool):
-        nonlocal cudnn_enabled, fallback_context_calls
+        nonlocal cudnn_enabled
         previous = cudnn_enabled
         cudnn_enabled = enabled
         enabled_calls.append(enabled)
-        fallback_context_calls += 1
         try:
             yield
         finally:
@@ -72,12 +71,90 @@ def test_depthwise_conv_block_always_disables_cudnn(monkeypatch) -> None:
 
     monkeypatch.setattr(torch.backends.cudnn, "flags", _fake_cudnn_flags)
 
-    assert cudnn_enabled
-    x = torch.randn(1, 8, 4, 4)
-    y = block(x)
-    assert cudnn_enabled
+    # CPU tensor: compute capability check is skipped, so the cuDNN-disabled fallback path runs.
+    x = torch.randn(1, 8, 4, 4)  # CPU tensor
+    block(x)
 
-    assert y.shape == x.shape
     assert fallback_dwconv.calls == 1
-    assert fallback_context_calls == 1
-    assert enabled_calls == [False]
+    assert enabled_calls == [False], "cuDNN should be disabled for non-CUDA (CPU/MPS) inputs"
+
+
+def test_depthwise_conv_block_enables_cudnn_on_ampere(monkeypatch) -> None:
+    """On Ampere+ GPUs (compute ≥ 8.0), depthwise conv should run WITH cuDNN enabled."""
+    block = DepthwiseConvBlock(dim=8)
+
+    cudnn_flags_entered = []
+
+    @contextmanager
+    def _fake_cudnn_flags(*, enabled: bool):
+        cudnn_flags_entered.append(enabled)
+        yield
+
+    monkeypatch.setattr(torch.backends.cudnn, "flags", _fake_cudnn_flags)
+
+    # Simulate an Ampere GPU (compute capability 8.0) by patching get_device_capability.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (8, 0))
+
+    class _MockCUDATensor:
+        """Minimal stand-in for a CUDA tensor to exercise the capability branch."""
+
+        @property
+        def device(self):
+            class _Device:
+                type = "cuda"
+                index = 0
+
+            return _Device()
+
+    class _MockDepthwiseConv(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, x) -> torch.Tensor:
+            self.calls += 1
+            return torch.zeros(1, 8, 4, 4)
+
+    fallback_dwconv = _MockDepthwiseConv()
+    block.dwconv = fallback_dwconv
+
+    mock_x = _MockCUDATensor()
+    block._depthwise_conv(mock_x)
+
+    assert fallback_dwconv.calls == 1
+    # cuDNN flags context should NOT have been entered for Ampere+.
+    assert cudnn_flags_entered == [], "cuDNN should NOT be disabled on Ampere+ GPUs"
+
+
+def test_depthwise_conv_block_disables_cudnn_on_pre_ampere(monkeypatch) -> None:
+    """On pre-Ampere CUDA (compute < 8.0, e.g. T4=7.5), cuDNN must be disabled."""
+    block = DepthwiseConvBlock(dim=8)
+
+    enabled_calls: list[bool] = []
+
+    @contextmanager
+    def _fake_cudnn_flags(*, enabled: bool):
+        enabled_calls.append(enabled)
+        yield
+
+    monkeypatch.setattr(torch.backends.cudnn, "flags", _fake_cudnn_flags)
+    # Simulate a T4 GPU (compute 7.5).
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (7, 5))
+
+    class _MockDepthwiseConv(torch.nn.Module):
+        def forward(self, x) -> torch.Tensor:
+            return torch.zeros(1, 8, 4, 4)
+
+    block.dwconv = _MockDepthwiseConv()
+
+    class _MockCUDATensor:
+        @property
+        def device(self):
+            class _Device:
+                type = "cuda"
+                index = 0
+
+            return _Device()
+
+    block._depthwise_conv(_MockCUDATensor())
+    assert enabled_calls == [False], "cuDNN must be disabled on pre-Ampere GPUs (e.g. T4)"

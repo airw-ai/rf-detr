@@ -42,12 +42,14 @@ class RFDETREMACallback(Callback):
         tau: int = 100,
         use_buffers: bool = True,
         update_interval_steps: int = 1,
+        ema_device: str = "gpu",
     ) -> None:
         super().__init__()
         self._decay = decay
         self._tau = tau
         self._use_buffers = use_buffers
         self._update_interval_steps = max(1, int(update_interval_steps))
+        self._ema_device = ema_device
 
         self._average_model: Optional[AveragedModel] = None
         self._latest_update_step = 0
@@ -94,9 +96,15 @@ class RFDETREMACallback(Callback):
         if stage != "fit":
             return
 
+        # When ema_device="cpu", keep EMA weights on CPU to avoid doubling GPU memory.
+        # AveragedModel.update_parameters moves model params to the averaged model's device
+        # before calling avg_fn, so the EMA computation runs on CPU. For validation, the
+        # CPU state dict is loaded into the GPU live model via load_state_dict (which handles
+        # the device transfer automatically).
+        ema_torch_device = torch.device("cpu") if self._ema_device == "cpu" else pl_module.device
         self._average_model = AveragedModel(
             model=pl_module,
-            device=pl_module.device,
+            device=ema_torch_device,
             use_buffers=self._use_buffers,
             avg_fn=self._avg_fn,
         )
@@ -180,6 +188,16 @@ class RFDETREMACallback(Callback):
         if trainer.current_epoch > self._latest_update_epoch and self.should_update(epoch_idx=trainer.current_epoch):
             self._average_model.update_parameters(pl_module)
             self._latest_update_epoch = trainer.current_epoch
+
+    def on_validation_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        """Move CPU-offloaded EMA model to GPU before validation forward passes."""
+        if self._average_model is not None and self._ema_device == "cpu":
+            self._average_model.to(pl_module.device)
+
+    def on_validation_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        """Return CPU-offloaded EMA model to CPU after validation."""
+        if self._average_model is not None and self._ema_device == "cpu":
+            self._average_model.to(torch.device("cpu"))
 
     def on_test_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
         """Evaluate tests using averaged EMA weights."""

@@ -169,16 +169,16 @@ class TestInit:
         assert module.model_config is mc
         assert module.train_config is tc
 
-    def test_compile_disabled_when_multi_scale_enabled(self, tmp_path):
-        """torch.compile is skipped when multi_scale=True (dynamic shapes)."""
+    def test_compile_enabled_with_multi_scale(self, tmp_path):
+        """torch.compile runs with multi_scale=True because dynamic=True handles varying input shapes."""
         mc = _base_model_config(compile=True)
         tc = _base_train_config(tmp_path, multi_scale=True)
         with (
             patch("torch.cuda.is_available", return_value=True),
-            patch("rfdetr.training.module_model.torch.compile") as mock_compile,
+            patch("rfdetr.training.module_model.torch.compile", side_effect=lambda m, **_: m) as mock_compile,
         ):
             _build_module(model_config=mc, train_config=tc, tmp_path=tmp_path)
-        mock_compile.assert_not_called()
+        mock_compile.assert_called_once()
 
     def test_compile_runs_when_enabled_and_static_shapes(self, tmp_path):
         """torch.compile runs when compile=True and multi_scale=False on CUDA."""
