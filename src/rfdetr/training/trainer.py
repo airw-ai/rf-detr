@@ -239,6 +239,17 @@ def build_trainer(
         "default_root_dir": tc.output_dir,
         "log_every_n_steps": 50,
         "deterministic": False,
+        # Skip validation forward passes on non-eval epochs.  Without this PTL
+        # runs the full validation DataLoader every epoch regardless of whether
+        # COCOEvalCallback will compute mAP — wasting GPU time on inference that
+        # produces no checkpoint signal.
+        "check_val_every_n_epoch": tc.eval_interval,
+        # Skip the pre-training sanity check. In DDP, the sanity check creates a
+        # validation DataLoader *after* NCCL is initialised. DataLoader workers are
+        # started via fork() and inherit NCCL IPC handles, corrupting the
+        # communicator in the main process. The first subsequent NCCL collective
+        # then hangs until the 30-minute NCCL watchdog timeout fires.
+        "num_sanity_val_steps": 0,
     }
     trainer_config.update(trainer_kwargs)
     return Trainer(**trainer_config)
