@@ -473,6 +473,18 @@ class TrainConfig(BaseModel):
     pin_memory: Optional[bool] = None
     persistent_workers: Optional[bool] = None
     prefetch_factor: Optional[int] = None
+    # DataLoader multiprocessing start method.  Defaults to "spawn" so that
+    # worker processes do not inherit NCCL IPC handles from the parent — a
+    # fork()-based worker that exits while the parent's NCCL communicator is
+    # live can corrupt it, causing the next collective to hang for the full
+    # NCCL watchdog timeout (30 min).  Set to None or "fork" only when you
+    # have confirmed that NCCL is not in use (e.g. single-GPU, CPU-only).
+    multiprocessing_context: Optional[Literal["fork", "spawn", "forkserver"]] = "spawn"
+    # Number of PTL sanity-check validation steps run before epoch 1.
+    # With multiprocessing_context="spawn" the pre-training sanity check is
+    # safe in DDP mode (workers start fresh, no NCCL handle inheritance).
+    # Set to 0 to disable, or any positive integer to limit the check.
+    num_sanity_val_steps: int = 2
 
     @field_validator("batch_size", mode="after")
     @classmethod

@@ -54,8 +54,13 @@ class RFDETRDataModule(LightningDataModule):
             self._prefetch_factor = (
                 self.train_config.prefetch_factor if self.train_config.prefetch_factor is not None else 2
             )
+            # Use the configured multiprocessing context so that worker processes
+            # do not inherit NCCL IPC handles from the parent (fork() after NCCL
+            # init corrupts the communicator; spawn/forkserver start fresh).
+            self._multiprocessing_context: Optional[str] = self.train_config.multiprocessing_context
         else:
             self._prefetch_factor = None
+            self._multiprocessing_context = None  # no workers → no subprocess context
 
     # ------------------------------------------------------------------
     # PTL lifecycle hooks
@@ -126,6 +131,7 @@ class RFDETRDataModule(LightningDataModule):
                 pin_memory=self._pin_memory,
                 persistent_workers=self._persistent_workers,
                 prefetch_factor=self._prefetch_factor,
+                multiprocessing_context=self._multiprocessing_context,
             )
 
         return DataLoader(
@@ -138,6 +144,7 @@ class RFDETRDataModule(LightningDataModule):
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
             prefetch_factor=self._prefetch_factor,
+            multiprocessing_context=self._multiprocessing_context,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -156,6 +163,7 @@ class RFDETRDataModule(LightningDataModule):
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
             prefetch_factor=self._prefetch_factor,
+            multiprocessing_context=self._multiprocessing_context,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -174,6 +182,7 @@ class RFDETRDataModule(LightningDataModule):
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
             prefetch_factor=self._prefetch_factor,
+            multiprocessing_context=self._multiprocessing_context,
         )
 
     def predict_dataloader(self) -> DataLoader:
@@ -192,6 +201,7 @@ class RFDETRDataModule(LightningDataModule):
             pin_memory=self._pin_memory,
             persistent_workers=self._persistent_workers,
             prefetch_factor=self._prefetch_factor,
+            multiprocessing_context=self._multiprocessing_context,
         )
 
     # ------------------------------------------------------------------

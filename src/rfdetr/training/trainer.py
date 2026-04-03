@@ -239,6 +239,15 @@ def build_trainer(
         "default_root_dir": tc.output_dir,
         "log_every_n_steps": 50,
         "deterministic": False,
+        # Skip validation forward passes on non-eval epochs.  Without this PTL
+        # runs the full validation DataLoader every epoch regardless of whether
+        # COCOEvalCallback will compute mAP — wasting GPU time on inference that
+        # produces no checkpoint signal.
+        "check_val_every_n_epoch": tc.eval_interval,
+        # Configurable pre-training sanity check.  Safe in DDP when the
+        # DataModule uses multiprocessing_context="spawn" (the default), because
+        # spawned workers start fresh and never inherit NCCL IPC handles.
+        "num_sanity_val_steps": tc.num_sanity_val_steps,
     }
     trainer_config.update(trainer_kwargs)
     return Trainer(**trainer_config)

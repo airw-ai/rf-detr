@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from pytorch_lightning import Callback
 from torchmetrics.detection import MeanAveragePrecision
@@ -202,7 +203,18 @@ class COCOEvalCallback(Callback):
             current_epoch = int(getattr(trainer, "current_epoch", 0)) + 1
             max_epochs = getattr(trainer, "max_epochs", None)
             is_last_epoch = isinstance(max_epochs, int) and max_epochs > 0 and current_epoch >= max_epochs
-            if current_epoch % self._eval_interval != 0 and not is_last_epoch:
+            skip = current_epoch % self._eval_interval != 0 and not is_last_epoch
+            # In DDP each rank tracks current_epoch independently via its own
+            # Trainer instance.  A one-off difference between ranks (e.g. from
+            # PTL's internal epoch-counter increment timing) causes some ranks to
+            # skip (early return) while others enter _compute_and_log, which
+            # issues DDP collectives.  Broadcast rank-0's decision so every rank
+            # agrees and they all either skip or compute together.
+            if dist.is_available() and dist.is_initialized():
+                flag = torch.tensor([int(skip)], dtype=torch.int32, device=pl_module.device)
+                dist.broadcast(flag, src=0)
+                skip = bool(flag.item())
+            if skip:
                 self.map_metric.reset()
                 if self.map_metric_ema is not None:
                     self.map_metric_ema.reset()
@@ -268,6 +280,15 @@ class COCOEvalCallback(Callback):
             pl_module: The LightningModule.
             split: Metric namespace — ``"val"`` or ``"test"``.
         """
+        # Synchronize all ranks before any DDP collectives. Without this, a
+        # one-off difference in local state (e.g. map_metric_ema presence on
+        # only some ranks due to a failed EMA forward pass) can shift those
+        # ranks' NCCL SeqNum ahead of the others — causing a 30-min watchdog
+        # timeout when the two groups reach different collectives at the same
+        # SeqNum slot.
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
         metrics = self.map_metric.compute()
 
         # torchmetrics prefixes all keys when iou_type is a list (e.g. "bbox_map")
@@ -297,7 +318,16 @@ class COCOEvalCallback(Callback):
 
         # EMA metrics — computed from a separate EMA forward pass accumulated
         # in on_validation_batch_end, so base and EMA values are independent.
-        if self.map_metric_ema is not None:
+        # Broadcast rank-0's view of whether the EMA metric exists so that all
+        # ranks agree.  If map_metric_ema is non-None on only some ranks (e.g.
+        # an EMA forward pass raised on specific GPUs), those ranks would call
+        # compute() while others skip it → NCCL SeqNum desync.
+        compute_ema = self.map_metric_ema is not None
+        if dist.is_available() and dist.is_initialized():
+            ema_flag = torch.tensor([int(compute_ema)], dtype=torch.int32, device=pl_module.device)
+            dist.broadcast(ema_flag, src=0)
+            compute_ema = bool(ema_flag.item())
+        if compute_ema and self.map_metric_ema is not None:
             ema_metrics = self.map_metric_ema.compute()
             ema_mar_key = f"{pfx}mar_{self._max_dets}"
             pl_module.log(f"{split}/ema_mAP_50_95", ema_metrics[f"{pfx}map"], prog_bar=True)
